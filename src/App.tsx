@@ -7,7 +7,7 @@ import { ScrcpyTab } from './components/ScrcpyTab';
 import { McpHubTab } from './components/McpHubTab';
 import { CmdRunnerTab } from './components/CmdRunnerTab';
 import { CliTab } from './components/CliTab';
-import { TerminalSquare, X } from 'lucide-react';
+import { SquareTerminal, X } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 
 export const App: React.FC = () => {
@@ -50,7 +50,7 @@ export const App: React.FC = () => {
           <div style={{ marginTop: 'auto' }}>
             <CyberButton onClick={() => setIsEventLogOpen(!isEventLogOpen)}>
               <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-                <TerminalSquare size={14} />
+                <SquareTerminal size={14} />
                 <span>LOGS</span>
               </div>
             </CyberButton>
