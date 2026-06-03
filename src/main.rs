@@ -7,6 +7,9 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::thread;
+use std::time::Duration;
 
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
@@ -56,12 +59,33 @@ struct Cc3App {
     api_server_name: String,
     mcp_configs: Vec<String>,
     ngrok_configs: Vec<String>,
+    task_rx: Option<Receiver<TaskResult>>,
+    task_running: bool,
+    task_title: Option<String>,
 }
 
 #[derive(Clone)]
 struct Device {
     id: String,
     state: String,
+}
+
+struct TaskResult {
+    title: String,
+    payload: TaskPayload,
+}
+
+enum TaskPayload {
+    Text(String),
+    Devices {
+        devices: Vec<Device>,
+        message: String,
+    },
+    Configs {
+        mcp_configs: Vec<String>,
+        ngrok_configs: Vec<String>,
+        message: String,
+    },
 }
 
 impl Cc3App {
@@ -87,6 +111,9 @@ impl Cc3App {
             api_server_name: "desktop-commander".to_owned(),
             mcp_configs: Vec::new(),
             ngrok_configs: Vec::new(),
+            task_rx: None,
+            task_running: false,
+            task_title: None,
         }
     }
 
@@ -94,33 +121,127 @@ impl Cc3App {
         self.output = format!("[{title}]\n{}", text.into());
     }
 
-    fn refresh_devices(&mut self) {
-        self.devices = get_devices();
-        if self.selected_device.is_empty() {
-            if let Some(first) = self.devices.first() {
-                self.selected_device = first.id.clone();
+    fn start_text_task<F>(&mut self, title: impl Into<String>, job: F)
+    where
+        F: FnOnce() -> String + Send + 'static,
+    {
+        self.start_task(title, move || TaskPayload::Text(job()));
+    }
+
+    fn start_task<F>(&mut self, title: impl Into<String>, job: F)
+    where
+        F: FnOnce() -> TaskPayload + Send + 'static,
+    {
+        if self.task_running {
+            let running = self.task_title.as_deref().unwrap_or("another task");
+            self.set_output(
+                "BUSY",
+                format!("Still running: {running}\nWait for it to finish before starting another command."),
+            );
+            return;
+        }
+
+        let title = title.into();
+        let (tx, rx) = mpsc::channel();
+        self.task_rx = Some(rx);
+        self.task_running = true;
+        self.task_title = Some(title.clone());
+        self.output = format!("[{title}]\nRunning in background…\nUI remains responsive.");
+
+        thread::spawn(move || {
+            let payload = job();
+            let _ = tx.send(TaskResult { title, payload });
+        });
+    }
+
+    fn poll_task(&mut self) {
+        let result = match self.task_rx.as_ref() {
+            Some(rx) => match rx.try_recv() {
+                Ok(result) => Some(result),
+                Err(TryRecvError::Empty) => None,
+                Err(TryRecvError::Disconnected) => Some(TaskResult {
+                    title: self.task_title.clone().unwrap_or_else(|| "task".to_owned()),
+                    payload: TaskPayload::Text("Worker disconnected before sending a result.".to_owned()),
+                }),
+            },
+            None => None,
+        };
+
+        if let Some(result) = result {
+            self.task_running = false;
+            self.task_rx = None;
+            self.task_title = None;
+
+            match result.payload {
+                TaskPayload::Text(text) => {
+                    self.output = format!("[{}]\n{}", result.title, text);
+                }
+                TaskPayload::Devices { devices, message } => {
+                    self.devices = devices;
+                    if self.selected_device.is_empty()
+                        || !self.devices.iter().any(|device| device.id == self.selected_device)
+                    {
+                        self.selected_device = self
+                            .devices
+                            .first()
+                            .map(|device| device.id.clone())
+                            .unwrap_or_default();
+                    }
+                    self.output = format!("[{}]\n{}", result.title, message);
+                }
+                TaskPayload::Configs {
+                    mcp_configs,
+                    ngrok_configs,
+                    message,
+                } => {
+                    self.mcp_configs = mcp_configs;
+                    self.ngrok_configs = ngrok_configs;
+                    self.output = format!("[{}]\n{}", result.title, message);
+                }
             }
         }
-        self.set_output("ADB DEVICES", format_devices(&self.devices));
+    }
+
+    fn refresh_devices(&mut self) {
+        self.start_task("ADB DEVICES", || {
+            let devices = get_devices();
+            let message = format_devices(&devices);
+            TaskPayload::Devices { devices, message }
+        });
     }
 
     fn scan_configs(&mut self) {
-        self.mcp_configs = list_matching(home_dir().join(".config").join("mcp-hub"), |name| name.ends_with(".json"));
-        self.ngrok_configs = list_matching(home_dir().join(".config").join("ngrok"), |name| name.ends_with(".yml") || name.ends_with(".yaml"));
-        self.set_output(
-            "CONFIG SCAN",
-            format!(
+        self.start_task("CONFIG SCAN", || {
+            let mcp_configs = list_matching(home_dir().join(".config").join("mcp-hub"), |name| {
+                name.ends_with(".json")
+            });
+            let ngrok_configs = list_matching(home_dir().join(".config").join("ngrok"), |name| {
+                name.ends_with(".yml") || name.ends_with(".yaml")
+            });
+            let message = format!(
                 "MCP configs:\n{}\n\nNgrok configs:\n{}",
-                empty_or_join(&self.mcp_configs),
-                empty_or_join(&self.ngrok_configs),
-            ),
-        );
+                empty_or_join(&mcp_configs),
+                empty_or_join(&ngrok_configs),
+            );
+            TaskPayload::Configs {
+                mcp_configs,
+                ngrok_configs,
+                message,
+            }
+        });
     }
 
     fn left_tabs(&mut self, ui: &mut egui::Ui) {
         ui.heading("CC3");
         ui.label("Rust + egui");
         ui.small("egui_extras enabled");
+        if self.task_running {
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.small(self.task_title.as_deref().unwrap_or("Running…"));
+            });
+        }
         ui.separator();
         ui.selectable_value(&mut self.tab, Tab::Projects, "PROJECTS");
         ui.selectable_value(&mut self.tab, Tab::McpHub, "MCP-HUB");
@@ -143,32 +264,41 @@ impl Cc3App {
         ui.horizontal_wrapped(|ui| {
             if ui.button("Git status").clicked() {
                 let cwd = self.project_dir.clone();
-                self.set_output("git status", exec_shell("git status", &cwd));
+                self.start_text_task("git status", move || exec_shell("git status", &cwd));
             }
             if ui.button("Git remote").clicked() {
                 let cwd = self.project_dir.clone();
-                self.set_output("git remote", exec_shell("git remote -v", &cwd));
+                self.start_text_task("git remote", move || exec_shell("git remote -v", &cwd));
             }
             if ui.button("Connect remote").clicked() {
                 let cwd = self.project_dir.clone();
-                let cmd = format!("git remote add origin {}", shell_escape(&self.remote_url));
-                self.set_output("connect remote", exec_shell(&cmd, &cwd));
+                let url = self.remote_url.clone();
+                self.start_text_task("connect remote", move || {
+                    let cmd = format!("git remote add origin {}", shell_escape(&url));
+                    exec_shell(&cmd, &cwd)
+                });
             }
             if ui.button("Create GH remote").clicked() {
                 let cwd = self.project_dir.clone();
-                self.set_output("create remote", exec_shell("gh repo create --private --source . --push", &cwd));
+                self.start_text_task("create remote", move || {
+                    exec_shell("gh repo create --private --source . --push", &cwd)
+                });
             }
             if ui.button("Fetch").clicked() {
                 let cwd = self.project_dir.clone();
-                self.set_output("git fetch", exec_shell("git fetch", &cwd));
+                self.start_text_task("git fetch", move || exec_shell("git fetch", &cwd));
             }
             if ui.button("Stage + push").clicked() {
                 let cwd = self.project_dir.clone();
-                self.set_output("stage + push", exec_shell("git add . && git commit -m \"Auto-commit from CC3\" && git push", &cwd));
+                self.start_text_task("stage + push", move || {
+                    exec_shell("git add . && git commit -m \"Auto-commit from CC3\" && git push", &cwd)
+                });
             }
             if ui.button("Zip project").clicked() {
                 let cwd = self.project_dir.clone();
-                self.set_output("zip project", exec_shell("git archive --format=zip HEAD -o project_export.zip", &cwd));
+                self.start_text_task("zip project", move || {
+                    exec_shell("git archive --format=zip HEAD -o project_export.zip", &cwd)
+                });
             }
         });
     }
@@ -180,29 +310,42 @@ impl Cc3App {
                 self.refresh_devices();
             }
             if ui.button("Launch scrcpy").clicked() {
-                let mut args = Vec::new();
-                if !self.selected_device.trim().is_empty() {
-                    args.push("-s".to_owned());
-                    args.push(self.selected_device.clone());
-                }
-                args.extend(split_args(&self.scrcpy_args));
-                self.set_output("scrcpy", spawn_detached("scrcpy", &args));
+                let selected_device = self.selected_device.clone();
+                let scrcpy_args = self.scrcpy_args.clone();
+                self.start_text_task("scrcpy", move || {
+                    let mut args = Vec::new();
+                    if !selected_device.trim().is_empty() {
+                        args.push("-s".to_owned());
+                        args.push(selected_device);
+                    }
+                    args.extend(split_args(&scrcpy_args));
+                    spawn_detached("scrcpy", &args)
+                });
             }
             if ui.button("Screenshot").clicked() {
                 let id = self.selected_device.clone();
-                self.set_output("screenshot", adb_screenshot(&id));
+                self.start_text_task("screenshot", move || adb_screenshot(&id));
             }
         });
 
         ui.add_space(8.0);
         self.device_table(ui);
 
+        let devices = self.devices.clone();
         egui::ComboBox::from_label("Selected device")
-            .selected_text(if self.selected_device.is_empty() { "Default device" } else { self.selected_device.as_str() })
+            .selected_text(if self.selected_device.is_empty() {
+                "Default device"
+            } else {
+                self.selected_device.as_str()
+            })
             .show_ui(ui, |ui| {
                 ui.selectable_value(&mut self.selected_device, String::new(), "Default device");
-                for device in &self.devices {
-                    ui.selectable_value(&mut self.selected_device, device.id.clone(), format!("{} [{}]", device.id, device.state));
+                for device in devices {
+                    ui.selectable_value(
+                        &mut self.selected_device,
+                        device.id.clone(),
+                        format!("{} [{}]", device.id, device.state),
+                    );
                 }
             });
 
@@ -212,35 +355,51 @@ impl Cc3App {
         ui.label("Wireless ADB target");
         ui.text_edit_singleline(&mut self.adb_ip);
         if ui.button("ADB connect").clicked() {
-            let args = vec!["connect".to_owned(), self.adb_ip.clone()];
-            self.set_output("adb connect", run_command("adb", &args, None));
-            self.devices = get_devices();
+            let ip = self.adb_ip.clone();
+            self.start_task("adb connect", move || {
+                let args = vec!["connect".to_owned(), ip];
+                let command_output = run_command("adb", &args, None);
+                let devices = get_devices();
+                let message = format!("{}\n\nDevices after connect:\n{}", command_output, format_devices(&devices));
+                TaskPayload::Devices { devices, message }
+            });
         }
     }
 
     fn device_table(&mut self, ui: &mut egui::Ui) {
         ui.label("ADB devices");
         let row_height = 24.0;
+        let devices = self.devices.clone();
         TableBuilder::new(ui)
             .striped(true)
             .resizable(true)
             .column(Column::auto())
             .column(Column::remainder())
             .header(row_height, |mut header| {
-                header.col(|ui| { ui.strong("State"); });
-                header.col(|ui| { ui.strong("Device ID"); });
+                header.col(|ui| {
+                    ui.strong("State");
+                });
+                header.col(|ui| {
+                    ui.strong("Device ID");
+                });
             })
             .body(|mut body| {
-                if self.devices.is_empty() {
+                if devices.is_empty() {
                     body.row(row_height, |mut row| {
-                        row.col(|ui| { ui.label("-"); });
-                        row.col(|ui| { ui.label("No devices found. Click Refresh devices."); });
+                        row.col(|ui| {
+                            ui.label("-");
+                        });
+                        row.col(|ui| {
+                            ui.label("No devices found. Click Refresh devices.");
+                        });
                     });
                 } else {
-                    for device in &self.devices {
+                    for device in devices {
                         let selected = self.selected_device == device.id;
                         body.row(row_height, |mut row| {
-                            row.col(|ui| { ui.label(&device.state); });
+                            row.col(|ui| {
+                                ui.label(&device.state);
+                            });
                             row.col(|ui| {
                                 if ui.selectable_label(selected, &device.id).clicked() {
                                     self.selected_device = device.id.clone();
@@ -260,29 +419,45 @@ impl Cc3App {
             .column(Column::auto())
             .column(Column::remainder())
             .header(24.0, |mut header| {
-                header.col(|ui| { ui.strong("Type"); });
-                header.col(|ui| { ui.strong("File"); });
+                header.col(|ui| {
+                    ui.strong("Type");
+                });
+                header.col(|ui| {
+                    ui.strong("File");
+                });
             })
             .body(|mut body| {
                 let mut wrote = false;
                 for name in &self.mcp_configs {
                     wrote = true;
                     body.row(22.0, |mut row| {
-                        row.col(|ui| { ui.label("mcp-hub"); });
-                        row.col(|ui| { ui.label(name); });
+                        row.col(|ui| {
+                            ui.label("mcp-hub");
+                        });
+                        row.col(|ui| {
+                            ui.label(name);
+                        });
                     });
                 }
                 for name in &self.ngrok_configs {
                     wrote = true;
                     body.row(22.0, |mut row| {
-                        row.col(|ui| { ui.label("ngrok"); });
-                        row.col(|ui| { ui.label(name); });
+                        row.col(|ui| {
+                            ui.label("ngrok");
+                        });
+                        row.col(|ui| {
+                            ui.label(name);
+                        });
                     });
                 }
                 if !wrote {
                     body.row(22.0, |mut row| {
-                        row.col(|ui| { ui.label("-"); });
-                        row.col(|ui| { ui.label("No configs scanned yet."); });
+                        row.col(|ui| {
+                            ui.label("-");
+                        });
+                        row.col(|ui| {
+                            ui.label("No configs scanned yet.");
+                        });
                     });
                 }
             });
@@ -301,9 +476,18 @@ impl Cc3App {
                 ui.text_edit_singleline(&mut self.mcp_config);
             });
             if ui.button("Start MCP Hub").clicked() {
-                let config_path = home_dir().join(".config").join("mcp-hub").join(&self.mcp_config);
-                let args = vec!["--port".to_owned(), self.mcp_port.clone(), "--config".to_owned(), config_path.display().to_string()];
-                self.set_output("mcp-hub", spawn_detached("mcp-hub", &args));
+                let port = self.mcp_port.clone();
+                let config_file = self.mcp_config.clone();
+                self.start_text_task("mcp-hub", move || {
+                    let config_path = home_dir().join(".config").join("mcp-hub").join(config_file);
+                    let args = vec![
+                        "--port".to_owned(),
+                        port,
+                        "--config".to_owned(),
+                        config_path.display().to_string(),
+                    ];
+                    spawn_detached("mcp-hub", &args)
+                });
             }
             if ui.button("Scan configs").clicked() {
                 self.scan_configs();
@@ -325,12 +509,16 @@ impl Cc3App {
                 ui.text_edit_singleline(&mut self.ngrok_url);
             });
             if ui.button("Start ngrok").clicked() {
-                let mut args = vec!["http".to_owned(), self.ngrok_target.clone()];
-                if !self.ngrok_url.trim().is_empty() {
-                    args.push("--url".to_owned());
-                    args.push(normalize_url(&self.ngrok_url));
-                }
-                self.set_output("ngrok", spawn_detached("ngrok", &args));
+                let target = self.ngrok_target.clone();
+                let url = self.ngrok_url.clone();
+                self.start_text_task("ngrok", move || {
+                    let mut args = vec!["http".to_owned(), target];
+                    if !url.trim().is_empty() {
+                        args.push("--url".to_owned());
+                        args.push(normalize_url(&url));
+                    }
+                    spawn_detached("ngrok", &args)
+                });
             }
         });
 
@@ -342,40 +530,52 @@ impl Cc3App {
         ui.text_edit_singleline(&mut self.api_server_name);
         ui.horizontal_wrapped(|ui| {
             if ui.button("Health").clicked() {
-                self.set_output("api health", http_json("GET", format!("{}/api/health", trim_url(&self.api_base_url)), None));
+                let base_url = self.api_base_url.clone();
+                self.start_text_task("api health", move || {
+                    http_json("GET", format!("{}/api/health", trim_url(&base_url)), None)
+                });
             }
             if ui.button("Refresh all").clicked() {
-                self.set_output("api refresh", http_json("POST", format!("{}/api/refresh", trim_url(&self.api_base_url)), None));
+                let base_url = self.api_base_url.clone();
+                self.start_text_task("api refresh", move || {
+                    http_json("POST", format!("{}/api/refresh", trim_url(&base_url)), None)
+                });
             }
             if ui.button("Start server").clicked() {
-                self.set_output("server start", self.server_api("start", false));
+                let base_url = self.api_base_url.clone();
+                let server_name = self.api_server_name.clone();
+                self.start_text_task("server start", move || {
+                    server_api(base_url, server_name, "start", false)
+                });
             }
             if ui.button("Stop server").clicked() {
-                self.set_output("server stop", self.server_api("stop", false));
+                let base_url = self.api_base_url.clone();
+                let server_name = self.api_server_name.clone();
+                self.start_text_task("server stop", move || {
+                    server_api(base_url, server_name, "stop", false)
+                });
             }
             if ui.button("Disable server").clicked() {
-                self.set_output("server disable", self.server_api("stop", true));
+                let base_url = self.api_base_url.clone();
+                let server_name = self.api_server_name.clone();
+                self.start_text_task("server disable", move || {
+                    server_api(base_url, server_name, "stop", true)
+                });
             }
             if ui.button("Refresh server").clicked() {
-                self.set_output("server refresh", self.server_api("refresh", false));
+                let base_url = self.api_base_url.clone();
+                let server_name = self.api_server_name.clone();
+                self.start_text_task("server refresh", move || {
+                    server_api(base_url, server_name, "refresh", false)
+                });
             }
             if ui.button("Restart hub").clicked() {
-                self.set_output("api restart", http_json("POST", format!("{}/api/restart", trim_url(&self.api_base_url)), None));
+                let base_url = self.api_base_url.clone();
+                self.start_text_task("api restart", move || {
+                    http_json("POST", format!("{}/api/restart", trim_url(&base_url)), None)
+                });
             }
         });
-    }
-
-    fn server_api(&self, endpoint: &str, disable: bool) -> String {
-        let suffix = if endpoint == "stop" {
-            format!("/api/servers/stop?disable={disable}")
-        } else {
-            format!("/api/servers/{endpoint}")
-        };
-        http_json(
-            "POST",
-            format!("{}{}", trim_url(&self.api_base_url), suffix),
-            Some(serde_json::json!({ "server_name": self.api_server_name })),
-        )
     }
 
     fn cmd_runner(&mut self, ui: &mut egui::Ui) {
@@ -383,8 +583,11 @@ impl Cc3App {
         ui.label("Kill port");
         ui.text_edit_singleline(&mut self.kill_port);
         if ui.button("Run npx kill-port").clicked() {
-            let args = vec!["-y".to_owned(), "kill-port".to_owned(), self.kill_port.clone()];
-            self.set_output("kill-port", spawn_detached("npx", &args));
+            let port = self.kill_port.clone();
+            self.start_text_task("kill-port", move || {
+                let args = vec!["-y".to_owned(), "kill-port".to_owned(), port];
+                spawn_detached("npx", &args)
+            });
         }
         ui.separator();
         ui.label("MCP proxy port");
@@ -414,33 +617,39 @@ impl Cc3App {
     }
 
     fn start_mcp_proxy(&mut self) {
-        let args = vec![
-            "--port".to_owned(),
-            self.proxy_port.clone(),
-            "node".to_owned(),
-            r"C:\Users\paul\Documents\.projects\mcp-server\DesktopCommanderMCP\dist\index.js".to_owned(),
-        ];
-        self.set_output("mcp-proxy", spawn_detached("mcp-proxy", &args));
+        let port = self.proxy_port.clone();
+        self.start_text_task("mcp-proxy", move || {
+            let args = vec![
+                "--port".to_owned(),
+                port,
+                "node".to_owned(),
+                r"C:\Users\paul\Documents\.projects\mcp-server\DesktopCommanderMCP\dist\index.js".to_owned(),
+            ];
+            spawn_detached("mcp-proxy", &args)
+        });
     }
 
     fn start_serena(&mut self) {
-        let args = vec![
-            "start-mcp-server".to_owned(),
-            "--transport".to_owned(),
-            "streamable-http".to_owned(),
-            "--host".to_owned(),
-            "0.0.0.0".to_owned(),
-            "--port".to_owned(),
-            self.serena_port.clone(),
-            "--mode".to_owned(),
-            "no-onboarding".to_owned(),
-            "--mode".to_owned(),
-            "query-projects".to_owned(),
-            "--project-from-cwd".to_owned(),
-            "--context".to_owned(),
-            "codex".to_owned(),
-        ];
-        self.set_output("serena", spawn_detached("serena", &args));
+        let port = self.serena_port.clone();
+        self.start_text_task("serena", move || {
+            let args = vec![
+                "start-mcp-server".to_owned(),
+                "--transport".to_owned(),
+                "streamable-http".to_owned(),
+                "--host".to_owned(),
+                "0.0.0.0".to_owned(),
+                "--port".to_owned(),
+                port,
+                "--mode".to_owned(),
+                "no-onboarding".to_owned(),
+                "--mode".to_owned(),
+                "query-projects".to_owned(),
+                "--project-from-cwd".to_owned(),
+                "--context".to_owned(),
+                "codex".to_owned(),
+            ];
+            spawn_detached("serena", &args)
+        });
     }
 
     fn placeholder(&mut self, ui: &mut egui::Ui, title: &str) {
@@ -450,7 +659,13 @@ impl Cc3App {
 
     fn output(&mut self, ui: &mut egui::Ui) {
         ui.separator();
-        ui.heading("Output");
+        ui.horizontal(|ui| {
+            ui.heading("Output");
+            if self.task_running {
+                ui.spinner();
+                ui.label(self.task_title.as_deref().unwrap_or("Running…"));
+            }
+        });
         ui.add(
             egui::TextEdit::multiline(&mut self.output)
                 .desired_rows(14)
@@ -461,15 +676,31 @@ impl Cc3App {
 
 impl eframe::App for Cc3App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.poll_task();
+        if self.task_running {
+            ctx.request_repaint_after(Duration::from_millis(100));
+        }
+
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new("CC3 Native").strong());
                 ui.separator();
                 ui.label("Rust + egui / eframe + egui_extras");
+                if self.task_running {
+                    ui.separator();
+                    ui.spinner();
+                    ui.label(format!(
+                        "Running: {}",
+                        self.task_title.as_deref().unwrap_or("background task")
+                    ));
+                }
             });
         });
 
-        egui::SidePanel::left("tabs").resizable(false).min_width(180.0).show(ctx, |ui| self.left_tabs(ui));
+        egui::SidePanel::left("tabs")
+            .resizable(false)
+            .min_width(180.0)
+            .show(ctx, |ui| self.left_tabs(ui));
 
         egui::CentralPanel::default().show(ctx, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
@@ -498,24 +729,41 @@ fn home_dir() -> PathBuf {
 
 fn list_matching(dir: PathBuf, predicate: impl Fn(&str) -> bool) -> Vec<String> {
     fs::read_dir(dir)
-        .map(|entries| entries.flatten().filter_map(|entry| entry.file_name().into_string().ok()).filter(|name| predicate(name)).collect())
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter_map(|entry| entry.file_name().into_string().ok())
+                .filter(|name| predicate(name))
+                .collect()
+        })
         .unwrap_or_default()
 }
 
 fn empty_or_join(values: &[String]) -> String {
-    if values.is_empty() { "none".to_owned() } else { values.join("\n") }
+    if values.is_empty() {
+        "none".to_owned()
+    } else {
+        values.join("\n")
+    }
 }
 
 fn get_devices() -> Vec<Device> {
-    let Ok(out) = Command::new("adb").arg("devices").output() else { return vec![] };
+    let Ok(out) = Command::new("adb").arg("devices").output() else {
+        return vec![];
+    };
     String::from_utf8_lossy(&out.stdout)
         .lines()
         .skip(1)
         .filter_map(|line| {
             let line = line.trim();
-            if line.is_empty() { return None; }
+            if line.is_empty() {
+                return None;
+            }
             let mut parts = line.split_whitespace();
-            Some(Device { id: parts.next()?.to_owned(), state: parts.next().unwrap_or("unknown").to_owned() })
+            Some(Device {
+                id: parts.next()?.to_owned(),
+                state: parts.next().unwrap_or("unknown").to_owned(),
+            })
         })
         .collect()
 }
@@ -524,12 +772,21 @@ fn format_devices(devices: &[Device]) -> String {
     if devices.is_empty() {
         "No devices found.".to_owned()
     } else {
-        devices.iter().map(|d| format!("{} [{}]", d.id, d.state)).collect::<Vec<_>>().join("\n")
+        devices
+            .iter()
+            .map(|d| format!("{} [{}]", d.id, d.state))
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 }
 
 fn split_args(input: &str) -> Vec<String> {
-    input.split_whitespace().map(str::trim).filter(|s| !s.is_empty()).map(ToOwned::to_owned).collect()
+    input
+        .split_whitespace()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
 }
 
 fn spawn_detached(program: &str, args: &[String]) -> String {
@@ -538,7 +795,11 @@ fn spawn_detached(program: &str, args: &[String]) -> String {
         use std::os::windows::process::CommandExt;
         const DETACHED_PROCESS: u32 = 0x00000008;
         const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
-        let line = std::iter::once(program.to_owned()).chain(args.iter().cloned()).map(|part| shell_escape(&part)).collect::<Vec<_>>().join(" ");
+        let line = std::iter::once(program.to_owned())
+            .chain(args.iter().cloned())
+            .map(|part| shell_escape(&part))
+            .collect::<Vec<_>>()
+            .join(" ");
         return match Command::new("cmd")
             .arg("/C")
             .arg(format!("start \"\" {line}"))
@@ -555,7 +816,13 @@ fn spawn_detached(program: &str, args: &[String]) -> String {
 
     #[cfg(not(windows))]
     {
-        match Command::new(program).args(args).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn() {
+        match Command::new(program)
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        {
             Ok(_) => format!("Launched: {} {}", program, args.join(" ")),
             Err(err) => format!("ERROR: {err}"),
         }
@@ -613,16 +880,41 @@ fn adb_screenshot(device_id: &str) -> String {
     let command = if device_id.trim().is_empty() {
         format!("adb exec-out screencap -p > {}", shell_escape_path(&picture_path))
     } else {
-        format!("adb -s {} exec-out screencap -p > {}", shell_escape(device_id), shell_escape_path(&picture_path))
+        format!(
+            "adb -s {} exec-out screencap -p > {}",
+            shell_escape(device_id),
+            shell_escape_path(&picture_path)
+        )
     };
-    format!("{}\n\nSaved path: {}", exec_shell(&command, ""), picture_path.display())
+    format!(
+        "{}\n\nSaved path: {}",
+        exec_shell(&command, ""),
+        picture_path.display()
+    )
+}
+
+fn server_api(base_url: String, server_name: String, endpoint: &'static str, disable: bool) -> String {
+    let suffix = if endpoint == "stop" {
+        format!("/api/servers/stop?disable={disable}")
+    } else {
+        format!("/api/servers/{endpoint}")
+    };
+    http_json(
+        "POST",
+        format!("{}{}", trim_url(&base_url), suffix),
+        Some(serde_json::json!({ "server_name": server_name })),
+    )
 }
 
 fn http_json(method: &str, url: String, body: Option<Value>) -> String {
     let result = match method {
         "POST" => {
             let request = ureq::post(&url).set("Content-Type", "application/json");
-            if let Some(body) = body { request.send_json(body) } else { request.call() }
+            if let Some(body) = body {
+                request.send_json(body)
+            } else {
+                request.call()
+            }
         }
         _ => ureq::get(&url).call(),
     };
@@ -639,12 +931,19 @@ fn http_json(method: &str, url: String, body: Option<Value>) -> String {
 }
 
 fn pretty_json(text: &str) -> String {
-    serde_json::from_str::<Value>(text).ok().and_then(|value| serde_json::to_string_pretty(&value).ok()).unwrap_or_else(|| text.to_owned())
+    serde_json::from_str::<Value>(text)
+        .ok()
+        .and_then(|value| serde_json::to_string_pretty(&value).ok())
+        .unwrap_or_else(|| text.to_owned())
 }
 
 fn normalize_url(value: &str) -> String {
     let trimmed = value.trim();
-    if trimmed.starts_with("http://") || trimmed.starts_with("https://") { trimmed.to_owned() } else { format!("https://{trimmed}") }
+    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        trimmed.to_owned()
+    } else {
+        format!("https://{trimmed}")
+    }
 }
 
 fn trim_url(value: &str) -> String {
@@ -656,7 +955,10 @@ fn shell_escape_path(path: &Path) -> String {
 }
 
 fn shell_escape(value: &str) -> String {
-    if value.chars().all(|c| c.is_ascii_alphanumeric() || "-_.:/\\".contains(c)) {
+    if value
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || "-_.:/\\".contains(c))
+    {
         value.to_owned()
     } else {
         format!("\"{}\"", value.replace('"', "\\\""))
@@ -664,5 +966,8 @@ fn shell_escape(value: &str) -> String {
 }
 
 fn timestamp_millis() -> u128 {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|duration| duration.as_millis()).unwrap_or_default()
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or_default()
 }
