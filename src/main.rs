@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use eframe::egui;
+use egui_extras::{Column, TableBuilder};
 use serde_json::Value;
 use std::env;
 use std::fs;
@@ -119,6 +120,7 @@ impl Cc3App {
     fn left_tabs(&mut self, ui: &mut egui::Ui) {
         ui.heading("CC3");
         ui.label("Rust + egui");
+        ui.small("egui_extras enabled");
         ui.separator();
         ui.selectable_value(&mut self.tab, Tab::Projects, "PROJECTS");
         ui.selectable_value(&mut self.tab, Tab::McpHub, "MCP-HUB");
@@ -192,6 +194,9 @@ impl Cc3App {
             }
         });
 
+        ui.add_space(8.0);
+        self.device_table(ui);
+
         egui::ComboBox::from_label("Selected device")
             .selected_text(if self.selected_device.is_empty() { "Default device" } else { self.selected_device.as_str() })
             .show_ui(ui, |ui| {
@@ -211,6 +216,76 @@ impl Cc3App {
             self.set_output("adb connect", run_command("adb", &args, None));
             self.devices = get_devices();
         }
+    }
+
+    fn device_table(&mut self, ui: &mut egui::Ui) {
+        ui.label("ADB devices");
+        let row_height = 24.0;
+        TableBuilder::new(ui)
+            .striped(true)
+            .resizable(true)
+            .column(Column::auto())
+            .column(Column::remainder())
+            .header(row_height, |mut header| {
+                header.col(|ui| { ui.strong("State"); });
+                header.col(|ui| { ui.strong("Device ID"); });
+            })
+            .body(|mut body| {
+                if self.devices.is_empty() {
+                    body.row(row_height, |mut row| {
+                        row.col(|ui| { ui.label("-"); });
+                        row.col(|ui| { ui.label("No devices found. Click Refresh devices."); });
+                    });
+                } else {
+                    for device in &self.devices {
+                        let selected = self.selected_device == device.id;
+                        body.row(row_height, |mut row| {
+                            row.col(|ui| { ui.label(&device.state); });
+                            row.col(|ui| {
+                                if ui.selectable_label(selected, &device.id).clicked() {
+                                    self.selected_device = device.id.clone();
+                                }
+                            });
+                        });
+                    }
+                }
+            });
+    }
+
+    fn config_table(&self, ui: &mut egui::Ui) {
+        ui.label("Detected config files");
+        TableBuilder::new(ui)
+            .striped(true)
+            .resizable(true)
+            .column(Column::auto())
+            .column(Column::remainder())
+            .header(24.0, |mut header| {
+                header.col(|ui| { ui.strong("Type"); });
+                header.col(|ui| { ui.strong("File"); });
+            })
+            .body(|mut body| {
+                let mut wrote = false;
+                for name in &self.mcp_configs {
+                    wrote = true;
+                    body.row(22.0, |mut row| {
+                        row.col(|ui| { ui.label("mcp-hub"); });
+                        row.col(|ui| { ui.label(name); });
+                    });
+                }
+                for name in &self.ngrok_configs {
+                    wrote = true;
+                    body.row(22.0, |mut row| {
+                        row.col(|ui| { ui.label("ngrok"); });
+                        row.col(|ui| { ui.label(name); });
+                    });
+                }
+                if !wrote {
+                    body.row(22.0, |mut row| {
+                        row.col(|ui| { ui.label("-"); });
+                        row.col(|ui| { ui.label("No configs scanned yet."); });
+                    });
+                }
+            });
     }
 
     fn mcp_hub(&mut self, ui: &mut egui::Ui) {
@@ -234,6 +309,9 @@ impl Cc3App {
                 self.scan_configs();
             }
         });
+
+        ui.add_space(8.0);
+        self.config_table(ui);
 
         ui.add_space(8.0);
         ui.group(|ui| {
@@ -387,7 +465,7 @@ impl eframe::App for Cc3App {
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new("CC3 Native").strong());
                 ui.separator();
-                ui.label("Rust + egui / eframe");
+                ui.label("Rust + egui / eframe + egui_extras");
             });
         });
 
