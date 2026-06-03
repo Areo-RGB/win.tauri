@@ -233,32 +233,32 @@ impl Cc3App {
         ui.horizontal_wrapped(|ui| {
             if ui.button("Git status").clicked() {
                 let cwd = self.project_dir.clone();
-                self.start_text_task("git status", move || exec_shell("git status", &cwd));
+                self.start_text_task("git status", move || run_command("git", &["status".to_owned()], Some(&cwd)));
             }
             if ui.button("Git remote").clicked() {
                 let cwd = self.project_dir.clone();
-                self.start_text_task("git remote", move || exec_shell("git remote -v", &cwd));
+                self.start_text_task("git remote", move || run_command("git", &["remote".to_owned(), "-v".to_owned()], Some(&cwd)));
             }
             if ui.button("Connect remote").clicked() {
                 let cwd = self.project_dir.clone();
                 let url = self.remote_url.clone();
-                self.start_text_task("connect remote", move || exec_shell(&format!("git remote add origin {}", shell_escape(&url)), &cwd));
+                self.start_text_task("connect remote", move || run_command("git", &["remote".to_owned(), "add".to_owned(), "origin".to_owned(), url], Some(&cwd)));
             }
             if ui.button("Create GH remote").clicked() {
                 let cwd = self.project_dir.clone();
-                self.start_text_task("create remote", move || exec_shell("gh repo create --private --source . --push", &cwd));
+                self.start_text_task("create remote", move || run_command("gh", &["repo".to_owned(), "create".to_owned(), "--private".to_owned(), "--source".to_owned(), ".".to_owned(), "--push".to_owned()], Some(&cwd)));
             }
             if ui.button("Fetch").clicked() {
                 let cwd = self.project_dir.clone();
-                self.start_text_task("git fetch", move || exec_shell("git fetch", &cwd));
+                self.start_text_task("git fetch", move || run_command("git", &["fetch".to_owned()], Some(&cwd)));
             }
             if ui.button("Stage + push").clicked() {
                 let cwd = self.project_dir.clone();
-                self.start_text_task("stage + push", move || exec_shell("git add . && git commit -m \"Auto-commit from CC3\" && git push", &cwd));
+                self.start_text_task("stage + push", move || git_stage_commit_push(&cwd));
             }
             if ui.button("Zip project").clicked() {
                 let cwd = self.project_dir.clone();
-                self.start_text_task("zip project", move || exec_shell("git archive --format=zip HEAD -o project_export.zip", &cwd));
+                self.start_text_task("zip project", move || run_command("git", &["archive".to_owned(), "--format=zip".to_owned(), "HEAD".to_owned(), "-o".to_owned(), "project_export.zip".to_owned()], Some(&cwd)));
             }
         });
     }
@@ -620,6 +620,31 @@ fn split_args(input: &str) -> Vec<String> {
     input.split_whitespace().map(str::trim).filter(|s| !s.is_empty()).map(ToOwned::to_owned).collect()
 }
 
+fn git_stage_commit_push(cwd: &str) -> String {
+    run_sequence(
+        cwd,
+        vec![
+            ("git", vec!["add".to_owned(), ".".to_owned()]),
+            ("git", vec!["commit".to_owned(), "-m".to_owned(), "Auto-commit from CC3".to_owned()]),
+            ("git", vec!["push".to_owned()]),
+        ],
+    )
+}
+
+fn run_sequence(cwd: &str, steps: Vec<(&str, Vec<String>)>) -> String {
+    let mut combined = String::new();
+    for (program, args) in steps {
+        let display = format!("{} {}", program, args.join(" "));
+        let (success, text) = run_command_checked(program, &args, Some(cwd));
+        combined.push_str(&format!("$ {display}\n{text}\n\n"));
+        if !success {
+            combined.push_str("Stopped after failed step.\n");
+            break;
+        }
+    }
+    combined
+}
+
 fn spawn_detached(program: &str, args: &[String]) -> String {
     #[cfg(windows)]
     {
@@ -658,28 +683,33 @@ fn spawn_detached(program: &str, args: &[String]) -> String {
 }
 
 fn run_command(program: &str, args: &[String], cwd: Option<&str>) -> String {
+    let (_, output) = run_command_checked(program, args, cwd);
+    output
+}
+
+fn run_command_checked(program: &str, args: &[String], cwd: Option<&str>) -> (bool, String) {
     let mut command = Command::new(program);
     command.args(args);
     if let Some(cwd) = cwd.filter(|value| !value.trim().is_empty()) { command.current_dir(cwd); }
-    command_output(command)
+    command_output_checked(command)
 }
 
-fn exec_shell(cmd: &str, cwd: &str) -> String {
-    let mut command = shell_command(cmd);
-    if !cwd.trim().is_empty() { command.current_dir(cwd); }
-    command_output(command)
-}
-
-fn command_output(mut command: Command) -> String {
+fn command_output_checked(mut command: Command) -> (bool, String) {
     match command.output() {
-        Ok(out) => format!("success: {}\n\nstdout:\n{}\n\nstderr:\n{}", out.status.success(), String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr)),
-        Err(err) => format!("ERROR: {err}"),
+        Ok(out) => {
+            let success = out.status.success();
+            (
+                success,
+                format!("success: {}\n\nstdout:\n{}\n\nstderr:\n{}", success, String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr)),
+            )
+        }
+        Err(err) => (false, format!("ERROR: {err}")),
     }
 }
 
 fn shell_command(cmd: &str) -> Command {
     #[cfg(windows)]
-    { let mut command = Command::new("cmd"); command.args(["/C", cmd]); command }
+    { let mut command = Command::new("cmd"); command.args(["/D", "/C", cmd]); command }
     #[cfg(not(windows))]
     { let mut command = Command::new("sh"); command.args(["-c", cmd]); command }
 }
@@ -688,12 +718,24 @@ fn adb_screenshot(device_id: &str) -> String {
     let pictures = home_dir().join("Pictures");
     let _ = fs::create_dir_all(&pictures);
     let picture_path = pictures.join(format!("screenshot_{}.png", timestamp_millis()));
-    let command = if device_id.trim().is_empty() {
-        format!("adb exec-out screencap -p > {}", shell_escape_path(&picture_path))
-    } else {
-        format!("adb -s {} exec-out screencap -p > {}", shell_escape(device_id), shell_escape_path(&picture_path))
-    };
-    format!("{}\n\nSaved path: {}", exec_shell(&command, ""), picture_path.display())
+
+    let mut args = Vec::new();
+    if !device_id.trim().is_empty() {
+        args.push("-s".to_owned());
+        args.push(device_id.to_owned());
+    }
+    args.extend(["exec-out".to_owned(), "screencap".to_owned(), "-p".to_owned()]);
+
+    let mut command = Command::new("adb");
+    command.args(&args);
+    match command.output() {
+        Ok(out) if out.status.success() => match fs::write(&picture_path, out.stdout) {
+            Ok(()) => format!("Saved to {}", picture_path.display()),
+            Err(err) => format!("ADB captured screenshot, but saving failed: {err}\nPath: {}", picture_path.display()),
+        },
+        Ok(out) => format!("ADB screenshot failed.\n\nstdout:\n{}\n\nstderr:\n{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr)),
+        Err(err) => format!("ERROR launching adb screenshot: {err}"),
+    }
 }
 
 fn server_api(base_url: String, server_name: String, endpoint: &'static str, disable: bool) -> String {
@@ -739,7 +781,8 @@ fn shell_escape_cmd_arg(value: &str) -> String {
     if value.chars().all(|c| c.is_ascii_alphanumeric() || "-_.:/\\".contains(c)) {
         value.to_owned()
     } else {
-        format!("\"{}\"", value.replace('"', "\\\"").replace('%', "%%"))
+        let escaped = value.replace('%', "%%").replace('"', "\\\"");
+        format!("\"{escaped}\"")
     }
 }
 fn timestamp_millis() -> u128 {
