@@ -1,8 +1,5 @@
-/node_modules
-/dist
-/src-tauri/target
-/src-tauri/gen
-.DS_Store
+/target
 *.log
 .env
 .env.*
+.DS_Store

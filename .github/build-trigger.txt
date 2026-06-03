@@ -1,2 +1,0 @@
-Triggered Windows Tauri build from ChatGPT on 2026-06-02.
-Retry after dependency and icon fixes.
