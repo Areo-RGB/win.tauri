@@ -626,10 +626,26 @@ fn spawn_detached(program: &str, args: &[String]) -> String {
         use std::os::windows::process::CommandExt;
         const DETACHED_PROCESS: u32 = 0x00000008;
         const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
-        let line = std::iter::once(program.to_owned()).chain(args.iter().cloned()).map(|part| shell_escape(&part)).collect::<Vec<_>>().join(" ");
-        return match Command::new("cmd").arg("/C").arg(format!("start \"\" {line}")).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP).spawn() {
-            Ok(_) => format!("Launched: {line}"),
-            Err(err) => format!("ERROR: {err}"),
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+        let command_line = std::iter::once(program.to_owned())
+            .chain(args.iter().cloned())
+            .map(|part| shell_escape_cmd_arg(&part))
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        return match Command::new("cmd")
+            .arg("/D")
+            .arg("/C")
+            .arg(&command_line)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW)
+            .spawn()
+        {
+            Ok(_) => format!("Launched detached: {command_line}"),
+            Err(err) => format!("ERROR launching {command_line}: {err}"),
         };
     }
     #[cfg(not(windows))]
@@ -718,6 +734,13 @@ fn trim_url(value: &str) -> String { value.trim_end_matches('/').to_owned() }
 fn shell_escape_path(path: &Path) -> String { shell_escape(&path.display().to_string()) }
 fn shell_escape(value: &str) -> String {
     if value.chars().all(|c| c.is_ascii_alphanumeric() || "-_.:/\\".contains(c)) { value.to_owned() } else { format!("\"{}\"", value.replace('"', "\\\"")) }
+}
+fn shell_escape_cmd_arg(value: &str) -> String {
+    if value.chars().all(|c| c.is_ascii_alphanumeric() || "-_.:/\\".contains(c)) {
+        value.to_owned()
+    } else {
+        format!("\"{}\"", value.replace('"', "\\\"").replace('%', "%%"))
+    }
 }
 fn timestamp_millis() -> u128 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|duration| duration.as_millis()).unwrap_or_default()
